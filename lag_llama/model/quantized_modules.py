@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from module import RMSNorm, CausalSelfAttention, LTSMConfig, MLP, find_multiple
+from lag_llama.model.module import RMSNorm, CausalSelfAttention, LTSMConfig, MLP, find_multiple
 from torch.nn import functional as F
 from typing import List, Optional
 from gluonts.torch.distributions import DistributionOutput
