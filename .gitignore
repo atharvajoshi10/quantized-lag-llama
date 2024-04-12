@@ -173,3 +173,7 @@ hyperparameters_lag_transformer
 
 # Virtual Env
 567
+
+*.ipynb
+*.ckpt
+*.tsv
