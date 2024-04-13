@@ -46,7 +46,9 @@ class QuantizedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.quant(x)
-        x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
+        x1 = self.dequant(self.c_fc1(x))
+        x2 = self.dequant(self.c_fc2(x))
+        x = self.quant(F.silu(x1) * x2)
         x = self.c_proj(x)
         return self.dequant(x)
     
