@@ -1,9 +1,10 @@
 import torch
 from torch import nn
-from lag_llama.model.module import RMSNorm, CausalSelfAttention, LTSMConfig, MLP, find_multiple
+from lag_llama.model.module import RMSNorm, CausalSelfAttention, LTSMConfig, find_multiple, LlamaRotaryEmbedding, LlamaDynamicNTKScalingRotaryEmbedding, \
+LlamaLinearScalingRotaryEmbedding, apply_rotary_pos_emb
 from torch.nn import functional as F
 from typing import List, Optional
-from gluonts.torch.distributions import DistributionOutput
+from lag_llama.quantized_gluonts.quantized_distribution_output import QuantizedDistributionOutput
 from gluonts.torch.scaler import MeanScaler, NOPScaler, StdScaler
 from gluon_utils.scalers.robust_scaler import RobustScaler
 import math
@@ -15,7 +16,7 @@ class QuantizedBlock(nn.Module):
     def __init__(self, config: LTSMConfig) -> None:
         super().__init__()
         self.rms_1 = RMSNorm(config.n_embd_per_head * config.n_head)
-        self.attn = CausalSelfAttention(config)
+        self.attn = QuantizedCausalSelfAttention(config)
         self.rms_2 = RMSNorm(config.n_embd_per_head * config.n_head)
         self.mlp = QuantizedMLP(config)
 
@@ -25,14 +26,176 @@ class QuantizedBlock(nn.Module):
         return y
     
 
+class QuantizedCausalSelfAttention(nn.Module):
+    def __init__(self, config: LTSMConfig) -> None:
+        super().__init__()
+        # query projections for all heads, but in a batch
+        self.q_proj = nn.Linear(
+            config.n_embd_per_head * config.n_head,
+            config.n_embd_per_head * config.n_head,
+            bias=False,
+        )
+        # key, value projections
+        self.kv_proj = nn.Linear(
+            config.n_embd_per_head * config.n_head,
+            2 * config.n_embd_per_head * config.n_head,
+            bias=False,
+        )
+        # output projection
+        self.c_proj = nn.Linear(
+            config.n_embd_per_head * config.n_head,
+            config.n_embd_per_head * config.n_head,
+            bias=False,
+        )
+        
+        self.quant1 = torch.quantization.QuantStub()
+        self.quant2 = torch.quantization.QuantStub()
+        self.dequant1 = torch.quantization.DeQuantStub()
+        self.dequant2 = torch.quantization.DeQuantStub()
+        self.dequant3 = torch.quantization.DeQuantStub()
+        self.dequant4 = torch.quantization.DeQuantStub()
+
+        self.n_head = config.n_head
+        self.n_embd_per_head = config.n_embd_per_head
+        self.block_size = config.block_size
+        self.dropout = config.dropout
+
+        self.rope_scaling = config.rope_scaling
+        self._rope_scaling_validation()
+
+        self._init_rope()
+        self.kv_cache = None
+
+    def _init_rope(self):
+        if self.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.n_embd_per_head, max_position_embeddings=self.block_size
+            )
+        else:
+            scaling_type = self.rope_scaling["type"]
+            scaling_factor = self.rope_scaling["factor"]
+            if scaling_type == "nope":
+                self.rotary_emb = None
+            elif scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.n_embd_per_head,
+                    max_position_embeddings=self.block_size,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.n_embd_per_head,
+                    max_position_embeddings=self.block_size,
+                    scaling_factor=scaling_factor,
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _rope_scaling_validation(self):
+        """
+        Validate the `rope_scaling` configuration.
+        """
+        if self.rope_scaling is None:
+            return
+
+        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
+            raise ValueError(
+                "`rope_scaling` must be a dictionary with with two fields, `type` and `factor`, "
+                f"got {self.rope_scaling}"
+            )
+        rope_scaling_type = self.rope_scaling.get("type", None)
+        rope_scaling_factor = self.rope_scaling.get("factor", None)
+        if rope_scaling_type is None or rope_scaling_type not in [
+            "linear",
+            "dynamic",
+            "nope",
+        ]:
+            raise ValueError(
+                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+            )
+        if rope_scaling_type in ["linear", "dynamic"]:
+            if (
+                rope_scaling_factor is None
+                or not isinstance(rope_scaling_factor, float)
+                or rope_scaling_factor < 1.0
+            ):
+                raise ValueError(
+                    f"`rope_scaling`'s factor field must be an float >= 1, got {rope_scaling_factor}"
+                )
+
+    def forward(self, x: torch.Tensor, use_kv_cache: bool) -> torch.Tensor:
+        # batch size, sequence length, embedding dimensionality (n_embd)
+        (B, T, C) = x.size()
+
+        x = self.quant1(x)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q = self.q_proj(x)
+        k, v = self.kv_proj(x).split(self.n_embd_per_head * self.n_head, dim=2)
+        k, q, v = self.dequant1(k), self.dequant2(q), self.dequant3(v)
+        if use_kv_cache:
+            # Optimized for single next prediction
+            if self.kv_cache is not None:
+                # Update cache
+                k = torch.cat([self.kv_cache[0], k], dim=1)[:, 1:]
+                v = torch.cat([self.kv_cache[1], v], dim=1)[:, 1:]
+                self.kv_cache = k, v
+            else:
+                # Build cache
+                self.kv_cache = k, v
+        
+        k = k.view(B, -1, self.n_head, self.n_embd_per_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        q = q.view(B, -1, self.n_head, self.n_embd_per_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        v = v.view(B, -1, self.n_head, self.n_embd_per_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        
+        if self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(device=v.device, dtype=v.dtype, seq_len=T)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        #  att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #  att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #  att = F.softmax(att, dim=-1)
+        #  y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # efficient attention using Flash Attention CUDA kernels
+        # When using kv cache at inference, is_causal=False since decoder is causal, at each generation step we want
+        # to avoid recalculating the same previous token attention
+        if use_kv_cache:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=False
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True
+            )
+
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.quant2(y)
+        # output projection
+        y = self.c_proj(y)
+        y = self.dequant4(y)
+        return y
+
+
 class QuantizedMLP(nn.Module):
     def __init__(self, config: LTSMConfig) -> None:
         super().__init__()
         hidden_dim = 4 * config.n_embd_per_head * config.n_head
         n_hidden = int(2 * hidden_dim / 3)
         n_hidden = find_multiple(n_hidden, 256)
-        self.quant = torch.quantization.QuantStub()
-        self.dequant = torch.quantization.DeQuantStub()
+        self.quant1 = torch.quantization.QuantStub()
+        self.quant2 = torch.quantization.QuantStub()
+        self.dequant1 = torch.quantization.DeQuantStub()
+        self.dequant2 = torch.quantization.DeQuantStub()
+        self.dequant3 = torch.quantization.DeQuantStub()
+
 
         self.c_fc1 = nn.Linear(
             config.n_embd_per_head * config.n_head, n_hidden, bias=False
@@ -45,12 +208,12 @@ class QuantizedMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.quant(x)
-        x1 = self.dequant(self.c_fc1(x))
-        x2 = self.dequant(self.c_fc2(x))
-        x = self.quant(F.silu(x1) * x2)
+        x = self.quant1(x)
+        x1 = self.dequant1(self.c_fc1(x))
+        x2 = self.dequant2(self.c_fc2(x))
+        x = self.quant2(F.silu(x1) * x2)
         x = self.c_proj(x)
-        return self.dequant(x)
+        return self.dequant3(x)
     
 
 class QuantizedLagLlamaModel(nn.Module):
@@ -64,7 +227,7 @@ class QuantizedLagLlamaModel(nn.Module):
         n_embd_per_head: int,
         n_head: int,
         lags_seq: List[int],
-        distr_output: DistributionOutput,
+        distr_output: QuantizedDistributionOutput,
         rope_scaling=None,
         num_parallel_samples: int = 100,
         time_feat: bool = True,
@@ -102,6 +265,11 @@ class QuantizedLagLlamaModel(nn.Module):
         self.param_proj = self.distr_output.get_args_proj(
             config.n_embd_per_head * config.n_head
         )
+        self.quant1 = torch.quantization.QuantStub()
+        self.dequant1 = torch.quantization.DeQuantStub()
+
+        self.quant2 = torch.quantization.QuantStub()
+        self.dequant2 = torch.quantization.DeQuantStub()
 
         self.transformer = nn.ModuleDict(
             dict(
@@ -207,12 +375,12 @@ class QuantizedLagLlamaModel(nn.Module):
         if use_kv_cache and self.y_cache:
             # Only use the most recent one, rest is in cache
             transformer_input = transformer_input[:, -1:]
-
+        transformer_input = self.quant1(transformer_input)
         # forward the LLaMA model itself
         x = self.transformer.wte(
             transformer_input
         )  # token embeddings of shape (b, t, n_embd_per_head*n_head) # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
-
+        x = self.dequant1(x)
         for block in self.transformer.h:
             x = block(x, use_kv_cache)
         x = self.transformer.ln_f(
