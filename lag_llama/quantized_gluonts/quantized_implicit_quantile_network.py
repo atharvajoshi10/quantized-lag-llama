@@ -1,3 +1,4 @@
+# Modified Quantile Distribution which uses Quantized Distribution Module
 
 from typing import Callable, Dict, Optional, Tuple
 from functools import partial
