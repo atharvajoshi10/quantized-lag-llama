@@ -13,7 +13,11 @@ from gluonts.time_feature import (
     get_lags_for_frequency,
     time_features_from_frequency_str,
 )
-from gluonts.torch.distributions import StudentTOutput, NegativeBinomialOutput
+
+from lag_llama.quantized_gluonts.quantized_implicit_quantile_network import QuantizedImplicitQuantileNetworkOutput
+from lag_llama.quantized_gluonts.quantized_negative_binomial import QuantizedNegativeBinomialOutput
+from lag_llama.quantized_gluonts.quantized_studentT import QuantizedStudentTOutput
+
 from gluonts.torch.model.estimator import PyTorchLightningEstimator
 from gluonts.torch.model.predictor import PyTorchPredictor
 from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
@@ -30,9 +34,7 @@ from gluonts.transform import (
     ValidationSplitSampler,
 )
 
-from gluon_utils.gluon_ts_distributions.implicit_quantile_network import (
-    ImplicitQuantileNetworkOutput,
-)
+
 from lag_llama.gluon.quantized_lightning_module import QuantizedLagLlamaLightningModule
 
 PREDICTION_INPUT_NAMES = [
@@ -174,11 +176,11 @@ class QuantizedLagLlamaEstimator(PyTorchLightningEstimator):
         self.lr = lr
         self.weight_decay = weight_decay
         if distr_output == "studentT":
-            distr_output = StudentTOutput()
+            distr_output = QuantizedStudentTOutput()
         elif distr_output == "neg_bin":
-            distr_output = NegativeBinomialOutput()
+            distr_output = QuantizedNegativeBinomialOutput()
         elif distr_output == "iqn":
-            distr_output = ImplicitQuantileNetworkOutput()
+            distr_output = QuantizedImplicitQuantileNetworkOutput()
         self.distr_output = distr_output
         self.num_parallel_samples = num_parallel_samples
         self.loss = loss
